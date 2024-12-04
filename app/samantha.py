@@ -69,7 +69,7 @@ async def setup_openai_realtime():
 
 @cl.on_chat_start
 async def start():
-    await cl.Message(content="Hello! I'm here. Press `P` to talk!").send()
+    await cl.Message(content="Hi there! I'm Samantha from Makerstreet. I'm here to help with web research, craft stunning graphs, or share everything you need to know about Skylla. Simply press the microphone and let's get started!").send()
     await setup_openai_realtime()
 
 
