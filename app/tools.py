@@ -6,15 +6,10 @@ import traceback
 import pinecone
 from openai import OpenAI
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Union
 import json
 from namespace_config import NamespaceConfig, NamespaceType, RegulationType
-
-"""
-Derived from https://github.com/Chainlit/cookbook/tree/main/realtime-assistant
-and https://github.com/disler/poc-realtime-ai-assistant/tree/main
-"""
-
+import re
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -29,6 +24,11 @@ from together import Together
 from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
+
+"""
+Derived from https://github.com/Chainlit/cookbook/tree/main/realtime-assistant
+and https://github.com/disler/poc-realtime-ai-assistant/tree/main
+"""
 
 # Setup logging
 logging.basicConfig(
@@ -142,6 +142,15 @@ def create_error_response(error_type: str, error_message: str) -> dict:
         "namespace": "general",
         "matched_patterns": []
     }
+
+def get_embedding(text: str, client: OpenAI) -> list[float]:
+    """Get an embedding for a text using OpenAI's API."""
+    text = text.replace("\n", " ")
+    result = client.embeddings.create(
+        model=Config.EMBEDDING_MODEL,
+        input=[text]
+    )
+    return result.data[0].embedding
 
 # Define the tools
 query_stock_price_def = {
@@ -622,267 +631,255 @@ async def execute_python_file_handler(filename: str):
 
 execute_python_file = (execute_python_file_def, execute_python_file_handler)
 
+class BrowserCommand(BaseModel):
+    """Browser command response."""
+    command_type: str = Field(
+        ...,
+        description="Type of command: 'direct_url' or 'search_result'"
+    )
+    url: str = Field(
+        ..., 
+        description="The URL to open or search query to use"
+    )
+    is_search: bool = Field(
+        ...,
+        description="Whether this is a search command"
+    )
+
+def clean_url(url: str) -> str:
+    """Add https:// if missing from URL."""
+    if not url.startswith(('http://', 'https://')):
+        return f'https://{url}'
+    return url
+
+def is_valid_url(url: str) -> bool:
+    """Check if string matches URL pattern."""
+    pattern = r'^(https?:\/\/)?([\w\d]+(\.[\w\d]+)+).*$'
+    return bool(re.match(pattern, url))
+
+def contains_url_indicators(text: str) -> bool:
+    """Check for Dutch website indicators."""
+    indicators = [
+        'www', '.nl', '.com', '.org', '.net',
+        'website', 'site', 'pagina', 'open'
+    ]
+    return any(ind in text.lower() for ind in indicators)
+
+def is_search_command(text: str) -> bool:
+    """Check for Dutch search result commands."""
+    search_terms = [
+        'zoekresultaat', 'zoek resultaat', 'resultaat',
+        'eerste link', 'eerste resultaat', 'link'
+    ]
+    return any(term in text.lower() for term in search_terms)
+
+def clean_search_query(text: str) -> str:
+    """Remove search command words from query."""
+    search_terms = [
+        'zoekresultaat', 'zoek resultaat', 'resultaat',
+        'eerste link', 'eerste resultaat', 'link',
+        'open', 'ga naar', 'bezoek'
+    ]
+    query = text.lower()
+    for term in search_terms:
+        query = query.replace(term, '')
+    return query.strip()
+
+async def perform_search(query: str) -> Dict:
+    """Execute search using Tavily."""
+    try:
+        response = tavily_client.search(query)
+        if not response.get("results"):
+            raise ValueError("Geen zoekresultaten gevonden")
+        return response["results"][0]
+    except Exception as e:
+        logger.error(f"Tavily search error: {str(e)}")
+        raise ValueError(f"Fout bij zoeken: {str(e)}")
+
+async def open_browser_handler(prompt: str) -> Dict[str, str]:
+    """Enhanced browser handler supporting direct URLs and search results."""
+    try:
+        logger.info(f"📖 Processing browser command: {prompt}")
+
+        # Initialize Groq for command analysis
+        llm = ChatGroq(
+            model="llama3-70b-8192",
+            api_key=os.environ.get("GROQ_API_KEY"),
+            temperature=0,
+            max_retries=2
+        )
+        structured_llm = llm.with_structured_output(BrowserCommand)
+
+        system_template = """
+        Analyseer het Nederlandse commando en bepaal of het een directe URL of zoekopdracht is.
+
+        Commando: {prompt}
+
+        Regels:
+        1. Als er een URL-patroon of website indicator is (www, .nl, .com, etc), classificeer als 'direct_url'
+        2. Als er zoekcommando's zijn (eerste link, zoekresultaat), classificeer als 'search_result'
+        3. Bij twijfel, kies 'search_result'
+        """
+
+        prompt_template = PromptTemplate(
+            input_variables=["prompt"],
+            template=system_template
+        )
+
+        chain = prompt_template | structured_llm
+        result = chain.invoke({"prompt": prompt})
+
+        # Process direct URL
+        if result.command_type == 'direct_url':
+            url = clean_url(result.url)
+            if not is_valid_url(url):
+                raise ValueError("Ongeldige URL gedetecteerd")
+                
+            logger.info(f"Opening URL: {url}")
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(pool, webbrowser.get('chrome').open, url)
+            return {"status": "success", "message": f"Website geopend: {url}"}
+
+        # Process search result
+        else:
+            query = clean_search_query(prompt)
+            search_result = await perform_search(query)
+            
+            if not search_result or not search_result.get('url'):
+                raise ValueError("Geen zoekresultaten gevonden")
+
+            url = search_result['url']
+            logger.info(f"Opening search result: {url}")
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor() as pool:
+                await loop.run_in_executor(pool, webbrowser.get('chrome').open, url)
+            return {"status": "success", "message": f"Zoekresultaat geopend: {url}"}
+
+    except Exception as e:
+        error_msg = f"Fout bij het openen van de browser: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        return {"status": "error", "message": error_msg}
+
+# Tool definition
 open_browser_def = {
     "name": "open_browser",
-    "description": "Opens a browser tab with the best-fitting URL based on the user's prompt.",
+    "description": "Opent een webbrowser met de opgegeven URL of zoekresultaat.",
     "parameters": {
         "type": "object",
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "The user's prompt to determine which URL to open.",
+                "description": "Het commando om een website te openen of zoekresultaat te tonen.",
             },
         },
         "required": ["prompt"],
     },
 }
 
-
-class WebUrl(BaseModel):
-    """
-    Web URL response.
-    """
-
-    url: str = Field(
-        ...,
-        description="The URL to open in the browser",
-    )
-
-
-async def open_browser_handler(prompt: str):
-    """
-    Open a browser tab with the best-fitting URL based on the user's prompt.
-    """
-    try:
-        logger.info(f"📖 open_browser() Prompt: {prompt}")
-
-        browser_urls = [
-            "https://www.chatgpt.com",
-            "https://www.tesla.com",
-            "https://www.spacex.com",
-        ]
-        browser_urls_str = "\n".join(browser_urls)
-        browser = "chrome"
-
-        prompt_structure = f"""
-        Select a browser URL from the list of browser URLs based on the user's prompt.
-
-        # Steps:
-        1. Infer the browser URL that the user wants to open from the user-prompt and the list of browser URLs.
-        2. If the user-prompt is not related to the browser URLs, return an empty string.
-
-        # Browser URLs:
-        {browser_urls_str}
-
-        # Prompt:
-        {prompt}
-        """
-
-        # Initialize the Groq chat model
-        llm = ChatGroq(
-            model="llama3-70b-8192",
-            api_key=os.environ.get("GROQ_API_KEY"),
-            temperature=0,
-            max_retries=2,
-        )
-
-        structured_llm = llm.with_structured_output(WebUrl)
-        response = structured_llm.invoke(prompt_structure)
-
-        logger.info(f"📖 open_browser() Response: {response}")
-
-        # Open the URL if it's not empty
-        if response.url:
-            logger.info(f"📖 open_browser() Opening URL: {response.url}")
-            loop = asyncio.get_running_loop()
-            with ThreadPoolExecutor() as pool:
-                await loop.run_in_executor(
-                    pool, webbrowser.get(browser).open, response.url
-                )
-            return f"URL opened successfully in the browser: {response.url}"
-        else:
-            error_message = f"Error retrieving URL from the prompt: {prompt}"
-            logger.error(f"❌ {error_message}")
-            await cl.Message(content=error_message).send()
-            return error_message
-
-    except Exception as e:
-        logger.error(f"❌ Error opening browser: {str(e)}")
-        return {"status": "Error", "message": str(e)}
-
-
 open_browser = (open_browser_def, open_browser_handler)
 
-retrieve_context_def = {
-    "name": "retrieve_context",
-    "description": "Retrieves relevant information from the knowledge base based on automatic namespace detection. Handles legal queries (GDPR, AI Act, Data Act), project-specific queries, and general knowledge.",
+kennisbank_def = {
+    "name": "kennisbank",
+    "description": "Zoekt in de kennisbank naar informatie over je vraag.",
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The user's question"
+                "description": "De vraag die je wilt stellen aan de kennisbank"
             }
         },
         "required": ["query"]
     }
 }
 
-class NamespaceManager:
-    _instance = None
-    _config = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(NamespaceManager, cls).__new__(cls)
-            cls._config = NamespaceConfig()
-        return cls._instance
-
-    @property
-    def config(self):
-        return self._config
-
-async def process_fallback_query(query_embedding, fallback_namespace="general"):
-    """Process fallback query when primary namespace search fails"""
+async def kennisbank_handler(query: str):
+    """Handle knowledge base queries"""
     try:
-        logger.info(f"Executing fallback query in namespace: {fallback_namespace}")
+        logger.info("=== Starting kennisbank_handler ===")
+        logger.info(f"Received query: {query}")
+
+        # Initialize Pinecone with new API
+        logger.info("Initializing Pinecone connection")
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key:
+            logger.error("Pinecone API key not found in environment variables")
+            raise PineconeQueryError("Pinecone API key not found")
+
+        # Create Pinecone instance
+        pc = pinecone.Pinecone(api_key=pinecone_api_key)
         
-        fallback_response = index.query(
+        # Get the index
+        index_name = os.getenv("PINECONE_INDEX_NAME", "samantha")
+        index = pc.Index(index_name)
+        logger.info(f"Connected to Pinecone index: {index_name}")
+
+        # Get embedding for query
+        logger.info("Generating embedding for query")
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        query_embedding = get_embedding(query, client)
+        logger.info("Successfully generated embedding")
+
+        # Query Pinecone with skylla namespace
+        pinecone_namespace = "skylla"
+        logger.info(f"Querying Pinecone with namespace: {pinecone_namespace}")
+        logger.info(f"Search parameters: top_k={Config.TOP_K_RESULTS}, confidence_threshold={Config.CONFIDENCE_THRESHOLD}")
+        
+        search_response = index.query(
             vector=query_embedding,
             top_k=Config.TOP_K_RESULTS,
-            include_metadata=True,
-            namespace=fallback_namespace
+            namespace=pinecone_namespace,
+            include_metadata=True
         )
-        logger.info(f"Found {len(fallback_response.matches)} fallback matches")
         
-        contexts = []
-        for match in fallback_response.matches:
-            logger.info(f"Processing fallback match with score: {match.score}")
-            if match.score >= Config.FALLBACK_THRESHOLD:
-                if match.metadata:
-                    try:
-                        metadata = DocumentMetadata(
-                            text=match.metadata.get('text', ''),
-                            source=match.metadata.get('source', 'Unknown source'),
-                            title=match.metadata.get('title', 'Untitled'),
-                            regulation_type=None,  # No regulation type in fallback
-                            project_name=None,     # No project name in fallback
-                            document_id=match.metadata.get('document_id')
-                        )
-                        contexts.append(metadata)
-                        logger.info(f"Added fallback context from source: {metadata.source}")
-                    except Exception as e:
-                        logger.warning(f"Error processing fallback metadata: {str(e)}")
-                        continue
-            else:
-                logger.debug(f"Skipping fallback match with low score: {match.score}")
-        
-        if not contexts:
-            logger.info(f"No high-confidence matches found in fallback namespace: {fallback_namespace}")
-        
-        return contexts
-        
-    except Exception as e:
-        logger.error(f"Fallback query failed in namespace {fallback_namespace}: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return None
+        logger.info(f"Received {len(search_response.matches)} matches from Pinecone")
 
-async def retrieve_context_handler(query: str):
-    """Handle context retrieval with proper namespace detection and error handling"""
-    try:
-        logger.info(f"Processing query: {query}")
-        
-        # Use NamespaceManager singleton instead of direct instantiation
-        ns_manager = NamespaceManager()
-        namespace_match = ns_manager.config.detect_namespace(query)
-        logger.info(f"Detected namespace: {namespace_match.namespace}")
-        logger.info(f"Namespace value: {namespace_match.namespace.value}")
-        logger.info(f"Confidence: {namespace_match.confidence}")
-        if namespace_match.regulation_type:
-            logger.info(f"Regulation type: {namespace_match.regulation_type}")
-        if namespace_match.project_name:
-            logger.info(f"Project name: {namespace_match.project_name}")
-        
-        # Get embedding using config model
-        embed_response = openai_client.embeddings.create(
-            model=Config.EMBEDDING_MODEL,
-            input=query
-        )
-        query_embedding = embed_response.data[0].embedding
-        
-        # Determine namespace for Pinecone query - only use base namespaces
-        base_namespace = namespace_match.namespace.value if namespace_match.namespace else "general"
-        pinecone_namespace = base_namespace  # Always use base namespace
-            
-        logger.info(f"Using Pinecone namespace: {pinecone_namespace}")
-        
-        try:
-            logger.info("Querying Pinecone...")
-            query_response = index.query(
-                vector=query_embedding,
-                top_k=Config.TOP_K_RESULTS,
-                include_metadata=True,
-                namespace=pinecone_namespace
-            )
-            logger.info(f"Found {len(query_response.matches)} matches")
-        except Exception as e:
-            raise PineconeQueryError(f"Failed to query Pinecone: {str(e)}")
-        
         contexts = []
-        for match in query_response.matches:
-            logger.info(f"Processing match with score: {match.score}")
-            if match.score >= Config.CONFIDENCE_THRESHOLD:
-                if match.metadata:
-                    try:
-                        metadata = DocumentMetadata(
-                            text=match.metadata.get('text', ''),
-                            source=match.metadata.get('source', 'Unknown source'),
-                            title=match.metadata.get('title', 'Untitled'),
-                            regulation_type=namespace_match.regulation_type.value if namespace_match.regulation_type else None,
-                            project_name=namespace_match.project_name,
-                            document_id=match.metadata.get('document_id')
-                        )
-                        contexts.append(metadata)
-                        logger.info(f"Added context from source: {metadata.source}")
-                    except Exception as e:
-                        logger.warning(f"Error processing metadata: {str(e)}")
-                        continue
-        
-        # If no high-confidence matches found, try general namespace fallback
-        if not contexts and pinecone_namespace != "general":
-            logger.info("No high-confidence matches found, trying general fallback...")
-            try:
-                logger.info("Trying general namespace fallback")
-                general_contexts = await process_fallback_query(query_embedding, fallback_namespace="general")
-                if general_contexts:
-                    contexts.extend(general_contexts)
-                    logger.info(f"Added {len(general_contexts)} fallback contexts from general namespace")
-            except Exception as e:
-                logger.warning(f"Fallback processing failed: {str(e)}")
-        
+        if search_response.matches:
+            for idx, match in enumerate(search_response.matches, 1):
+                logger.info(f"Processing match {idx}/{len(search_response.matches)} with score: {match.score}")
+                
+                if match.score < Config.CONFIDENCE_THRESHOLD:
+                    logger.info(f"Skipping match {idx} - below confidence threshold ({match.score} < {Config.CONFIDENCE_THRESHOLD})")
+                    continue
+
+                try:
+                    metadata = DocumentMetadata(
+                        text=match.metadata.get('text', ''),
+                        source=match.metadata.get('source', ''),
+                        title=match.metadata.get('title', ''),
+                        project_name="Skylla",
+                        document_id=match.metadata.get('document_id')
+                    )
+                    contexts.append(metadata)
+                    logger.info(f"Added context from source: {metadata.source}")
+                    logger.info(f"Context title: {metadata.title}")
+                    logger.info(f"Context text preview: {metadata.text[:100]}...")
+                except Exception as e:
+                    logger.warning(f"Error processing metadata for match {idx}: {str(e)}")
+                    continue
+
+        logger.info(f"Final number of relevant contexts found: {len(contexts)}")
+
         # Convert DocumentMetadata objects to dictionaries for JSON serialization
         context_dicts = [ctx.to_dict() for ctx in contexts]
         
         result = {
             "contexts": context_dicts,
-            "confidence": max((match.score for match in query_response.matches), default=0),
-            "source": [ctx["source"] for ctx in context_dicts],
-            "namespace": pinecone_namespace,
-            "matched_patterns": namespace_match.matched_patterns if namespace_match else [],
-            "regulation_type": namespace_match.regulation_type.value if namespace_match.regulation_type else None
+            "query": query
         }
         
-        logger.info(f"Final result: {json.dumps(result, default=str)}")
+        logger.info("=== Finished kennisbank_handler successfully ===")
         return result
-        
-    except NamespaceError as e:
-        logger.error(f"Namespace error: {str(e)}")
-        return create_error_response("Namespace error occurred", str(e))
-    except PineconeQueryError as e:
-        logger.error(f"Pinecone query error: {str(e)}")
-        return create_error_response("Pinecone query error occurred", str(e))
 
-retrieve_context = (retrieve_context_def, retrieve_context_handler)
+    except Exception as e:
+        logger.error(f"=== Error in kennisbank_handler ===")
+        logger.error(f"Error details: {str(e)}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        return create_error_response("retrieval_error", str(e))
+
+kennisbank = (kennisbank_def, kennisbank_handler)
 
 tools = [
     query_stock_price,
@@ -893,5 +890,5 @@ tools = [
     create_python_file,
     execute_python_file,
     open_browser,
-    retrieve_context,  # Add our new tool
+    kennisbank
 ]
